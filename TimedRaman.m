@@ -701,7 +701,8 @@ function cb_norm(src, ~)
     fig = ancestor(src,'figure'); D = guidata(fig);
     modes = {'none','max','gaas','custom'};
     D.norm_mode = modes{get(src,'Value')};
-    set(D.hs.norm_wn,'Enable', strcmp(D.norm_mode,'custom')*1);
+    if strcmp(D.norm_mode,'custom'), en = 'on'; else, en = 'off'; end
+    set(D.hs.norm_wn,'Enable', en);
     guidata(fig,D); refresh_plot(fig);
 end
 
@@ -754,7 +755,7 @@ function cb_als_lam(src, ~)
 end
 function cb_als_p(src, ~)
     fig = ancestor(src,'figure'); D = guidata(fig);
-    pv = [0.001 0.002 0.005 0.01 0.02 0.05 0.10 0.20 0.50];
+    pv = als_p_values();
     set(D.hs.als_p_lbl,'String',num2str(pv(round(get(src,'Value')))));
     if get(D.hs.live_preview,'Value') && get(D.hs.als_on,'Value')
         refresh_plot(fig);
@@ -780,10 +781,7 @@ function cb_apply_processing(src, ~)
     sg_o      = round(get(D.hs.sg_ord,'Value'));
     ma_w      = round(get(D.hs.ma_win,'Value'));
     if mod(ma_w,2)==0, ma_w = ma_w+1; end
-    als_e     = round(get(D.hs.als_lam,'Value'));
-    pv        = [0.001 0.002 0.005 0.01 0.02 0.05 0.10 0.20 0.50];
-    als_p     = pv(round(get(D.hs.als_p,'Value')));
-    als_it    = round(get(D.hs.als_iter,'Value'));
+    [als_lam, als_p, als_it] = read_als_params(D);
 
     scope = get(D.hs.scope_popup,'Value');
     if scope==2
@@ -806,7 +804,7 @@ function cb_apply_processing(src, ~)
                 y = ma_smooth(y, ma_w);
             end
         end
-        if als_on, bl = als_baseline(y, 10^als_e, als_p, als_it); y = y - bl; end
+        if als_on, bl = als_baseline(y, als_lam, als_p, als_it); y = y - bl; end
         D.proc{k} = y;
     end
     guidata(fig,D);
@@ -949,20 +947,14 @@ function plot_one(ax, D, k, offset, is_sel)
     if is_sel && get(D.hs.live_preview,'Value') && get(D.hs.sg_on,'Value')
         y_live = compute_live_smooth(D, D.raw{k});
         if get(D.hs.als_on,'Value') && ~isempty(y_live)
-            pv     = [0.001 0.002 0.005 0.01 0.02 0.05 0.10 0.20 0.50];
-            als_lam= 10^round(get(D.hs.als_lam,'Value'));
-            als_p  = pv(round(get(D.hs.als_p,'Value')));
-            als_it = round(get(D.hs.als_iter,'Value'));
+            [als_lam, als_p, als_it] = read_als_params(D);
             bl     = als_baseline(y_live, als_lam, als_p, als_it);
             y_live = y_live - bl;
         end
         y_live = apply_norm(D, y_live, wn);
     elseif is_sel && get(D.hs.live_preview,'Value') && get(D.hs.als_on,'Value')
         % ALS only, no smoothing
-        pv     = [0.001 0.002 0.005 0.01 0.02 0.05 0.10 0.20 0.50];
-        als_lam= 10^round(get(D.hs.als_lam,'Value'));
-        als_p  = pv(round(get(D.hs.als_p,'Value')));
-        als_it = round(get(D.hs.als_iter,'Value'));
+        [als_lam, als_p, als_it] = read_als_params(D);
         bl     = als_baseline(D.raw{k}, als_lam, als_p, als_it);
         y_live = apply_norm(D, D.raw{k} - bl, wn);
     end
@@ -1038,8 +1030,9 @@ function y = apply_norm(D, y, wn)
     if isempty(y), return; end
     switch D.norm_mode
         case 'max'
-            % Use 95th percentile instead of max — immune to single spikes
-            pk = prctile(y, 95);
+            % Use 95th percentile instead of max — immune to single spikes.
+            % pct() is a toolbox-free replacement for prctile (Stats Toolbox).
+            pk = pct(y, 95);
             if pk > 0, y = y / pk; end
         case 'gaas'
             y = norm_to_peak(y, wn, 269);
@@ -1316,7 +1309,7 @@ function [wavenumber, intensity, meta] = read_wdf_full(filepath)
 
     % XLST block
     if xlst_pos==0
-        wavenumber=(1:npts)'; return;
+        wavenumber=(1:numel(intensity))'; return;
     end
     xlst_blk_size = double(typecast(raw(xlst_pos+8:xlst_pos+15),'uint64'));
     if (xlst_blk_size-16)>=(8+npts*4)
@@ -1328,6 +1321,13 @@ function [wavenumber, intensity, meta] = read_wdf_full(filepath)
     if we>numel(raw), error('XLST past EOF: %s',filepath); end
     wavenumber = double(typecast(raw(ws:we),'single'));
 
+    % Guard: a truncated DATA or XLST block can leave the two axes at
+    % different lengths, which would otherwise throw far downstream at
+    % plot/export time. Clamp both to the common length here at the source.
+    np_common  = min(numel(wavenumber), numel(intensity));
+    wavenumber = wavenumber(1:np_common);
+    intensity  = intensity(1:np_common);
+
     meta.wavenumber_min = min(wavenumber);
     meta.wavenumber_max = max(wavenumber);
 end
@@ -1335,6 +1335,34 @@ end
 % ══════════════════════════════════════════════════════════════════════
 %  SHARED HELPERS
 % ══════════════════════════════════════════════════════════════════════
+function v = pct(x, q)
+% Toolbox-free percentile — matches prctile's default (linear interpolation
+% of the sorted sample at plotting positions 100*(i-0.5)/n). Avoids the
+% Statistics & Machine Learning Toolbox so the app stays dependency-free.
+    x = sort(x(:));
+    n = numel(x);
+    if n == 0, v = NaN; return; end
+    if n == 1, v = x(1); return; end
+    pos = 100*((1:n)' - 0.5)/n;
+    if q <= pos(1),   v = x(1);   return; end
+    if q >= pos(end), v = x(end); return; end
+    v = interp1(pos, x, q, 'linear');
+end
+
+function pv = als_p_values()
+% Single source of truth for the ALS asymmetry-slider lookup values.
+% Previously this literal array was duplicated in four places.
+    pv = [0.001 0.002 0.005 0.01 0.02 0.05 0.10 0.20 0.50];
+end
+
+function [lam, p, it] = read_als_params(D)
+% Read the three ALS baseline parameters from the sliders in one place.
+    pv  = als_p_values();
+    lam = 10^round(get(D.hs.als_lam,'Value'));
+    p   = pv(round(get(D.hs.als_p,'Value')));
+    it  = round(get(D.hs.als_iter,'Value'));
+end
+
 function refresh_list(D)
     n = numel(D.filenames);
     if n==0, set(D.hs.file_list,'String',{}); return; end
